@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Output buffer file to store history
+BUFFER_FILE="/tmp/findappt_buffer.txt"
+MAX_BUFFER_RUNS=10
+
+# Alert tracking files
+ALERT_COUNT_FILE="/tmp/findappt_alert_counts.txt"
+EMAIL_SENT_FILE="/tmp/findappt_emails_sent.txt"
+MAX_CONSECUTIVE_ALERTS=8
+
+# Script to find the earliest DMV appointment dates in NJ by city/site ID.
+# --- Paste your document's "City, siteid" lines here (exactly as-is) ---
+read -r -d '' CITY_SITE_BLOCK <<'TXT' || true
+Newton, 485
+Randolph, 123
+Newark, 116
+North Bergen, 117
+Rahway, 122
+Oakland, 119
+Washington, 486
+Lodi, 114
+Wayne, 118
+TXT
+
+BASE_URL="https://telegov.njportal.com/njmvc/AppointmentWizard/11"
+
+# Collect "epoch|site_id|city|iso_date|raw_date" records into RESULTS
+RESULTS=()
+
+# Parse the block: "City, siteid" (tolerate spaces)
+while IFS= read -r line; do
+  # skip empties
+  [[ -z "${line//[[:space:]]/}" ]] && continue
+
+  city="${line%%,*}"
+  siteid="$(printf "%s" "${line#*,}" | xargs)"    # trim spaces
+  city="$(printf "%s" "$city" | xargs)"
+
+  # Skip if either is empty
+  [[ -z "$city" || -z "$siteid" ]] && continue
+
+  url="${BASE_URL}/${siteid}"
+  #echo "---" 1>&2
+  #echo "City: $city, SiteID: $siteid" 1>&2
+  #echo "Fetching: $url" 1>&2
+  # Fetch page (silent, follow redirects, fail on HTTP >=400, short timeouts)
+  html="$(curl -sS -L --fail --connect-timeout 5 --max-time 15 "$url" || true)"
+  #echo "HTML length: ${#html}" 1>&2
+
+  # Get the FIRST label line containing "Time of Appointment"
+  # Example line:
+  # <label class="control-label date-time">Time of Appointment for November 17, 2025: </label>
+  label_line="$(printf '%s' "$html" | grep -m1 'Time of Appointment' || true)"
+  #echo "Label line: $label_line" 1>&2
+
+  # Extract just the date text between "for " and ":" (no PCRE needed)
+  # Yields e.g. "November 17, 2025" or "November 17, 2025 3:30 PM"
+  raw_date="$(printf '%s' "$label_line" | sed -n 's/.*Time of Appointment[[:space:]]*for[[:space:]]*\([^:]*\):.*/\1/p' | xargs)"
+  #echo "Raw date: $raw_date" 1>&2
+
+  epoch=""
+  iso=""
+  if [[ -n "$raw_date" ]]; then
+    # Try to parse date - works on macOS BSD date
+    if epoch="$(date -j -f "%B %d, %Y" "$raw_date" +%s 2>/dev/null)"; then
+      iso="$(date -j -f %s "$epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null)"
+      #echo "Parsed epoch: $epoch, ISO: $iso" 1>&2
+    #else
+      #echo "Failed to parse date: $raw_date" 1>&2
+    fi
+  fi
+
+  # Use epoch=0 for missing/failed parse so they sort last
+  epoch="${epoch:-0}"
+  iso="${iso:-}"
+  #echo "Final epoch: $epoch" 1>&2
+
+  RESULTS+=("${epoch}|${siteid}|${city}|${iso}|${raw_date}|${url}")
+done <<< "$CITY_SITE_BLOCK"
+
+#echo "DEBUG: RESULTS array:" 1>&2
+#printf '%s\n' "${RESULTS[@]}" 1>&2
+#echo "---END DEBUG---" 1>&2
+
+# Check if any appointment is within 3 days
+now_epoch=$(date +%s)
+three_days_from_now=$((now_epoch + 3*24*60*60))
+found_soon=false
+soonest_info=""
+soonest_key=""
+
+for result in "${RESULTS[@]}"; do
+  result_epoch="${result%%|*}"
+  if [[ "$result_epoch" != "0" ]] && [[ "$result_epoch" -le "$three_days_from_now" ]] && [[ "$result_epoch" -ge "$now_epoch" ]]; then
+    found_soon=true
+    # Extract info: epoch|siteid|city|iso|raw_date|url
+    IFS='|' read -r epoch siteid city iso raw_date url <<< "$result"
+    soonest_info="$city on $raw_date - $url"
+    soonest_key="${siteid}_${raw_date// /_}"
+    break
+  fi
+done
+
+if [[ "$found_soon" == "true" ]]; then
+  # Get current alert count for this appointment
+  current_count=0
+  if [[ -f "$ALERT_COUNT_FILE" ]]; then
+    current_count=$(grep "^${soonest_key}=" "$ALERT_COUNT_FILE" 2>/dev/null | cut -d'=' -f2 || echo "0")
+    current_count=${current_count:-0}
+  fi
+  
+  # Only alert if we haven't exceeded the limit
+  if [[ $current_count -lt $MAX_CONSECUTIVE_ALERTS ]]; then
+    echo "🔔 ALERT: Appointment available within 3 days! (Alert $((current_count + 1))/$MAX_CONSECUTIVE_ALERTS)" 1>&2
+    echo "$soonest_info" 1>&2
+    
+    # Play system sound on macOS
+    afplay /System/Library/Sounds/Glass.aiff 2>/dev/null || true
+    
+    # Send email only if we haven't sent one for this specific appointment
+    email_sent=false
+    if [[ -f "$EMAIL_SENT_FILE" ]] && grep -q "^${soonest_key}$" "$EMAIL_SENT_FILE" 2>/dev/null; then
+      email_sent=true
+    fi
+    
+    if [[ "$email_sent" == "false" ]]; then
+      phone_email="9736705400@tmomail.net"
+      echo "$soonest_info" | mail -s "NJ MVC Appointment Available" "$phone_email" 2>/dev/null || echo "Warning: mail command failed" 1>&2
+      echo "$soonest_key" >> "$EMAIL_SENT_FILE"
+      echo "📧 Email sent for this appointment" 1>&2
+    fi
+    
+    # Increment alert count - update or add entry
+    if [[ -f "$ALERT_COUNT_FILE" ]]; then
+      grep -v "^${soonest_key}=" "$ALERT_COUNT_FILE" > "${ALERT_COUNT_FILE}.tmp" 2>/dev/null || true
+      mv "${ALERT_COUNT_FILE}.tmp" "$ALERT_COUNT_FILE"
+    fi
+    echo "${soonest_key}=$((current_count + 1))" >> "$ALERT_COUNT_FILE"
+  else
+    echo "🔕 Alert limit reached for $soonest_info (suppressed)" 1>&2
+  fi
+else
+  # Clear alert counts and email tracking when no appointments are within 3 days
+  > "$ALERT_COUNT_FILE"
+  > "$EMAIL_SENT_FILE"
+fi
+
+# Prepare current results with timestamp
+current_run="=== Run at $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+# Color code results based on date proximity
+now_epoch=$(date +%s)
+three_days=$((now_epoch + 3*24*60*60))
+seven_days=$((now_epoch + 7*24*60*60))
+
+# ANSI color codes
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+RED=$'\033[0;31m'
+RESET=$'\033[0m'
+
+# Display current run at the top
+echo "$current_run"
+
+# Display and collect current results with colors
+current_results_plain=""
+while IFS='|' read -r epoch siteid city iso raw_date url; do
+  line="${siteid},${city},${raw_date},${url}"
+  current_results_plain="${current_results_plain}${line}"$'\n'
+  
+  if [[ "$epoch" != "0" ]] && [[ "$epoch" -le "$three_days" ]]; then
+    # 3 days or earlier - GREEN
+    echo "${GREEN}${line}${RESET}"
+  elif [[ "$epoch" != "0" ]] && [[ "$epoch" -le "$seven_days" ]]; then
+    # 4 to 7 days - YELLOW
+    echo "${YELLOW}${line}${RESET}"
+  else
+    # More than 7 days or no date - RED
+    echo "${RED}${line}${RESET}"
+  fi
+done < <(printf '%s\n' "${RESULTS[@]}" | sort -t '|' -k1,1n -k2,2)
+echo ""
+
+# Show previous runs from buffer if they exist
+if [[ -f "$BUFFER_FILE" ]]; then
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Previous Runs:"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  
+  # Read and colorize buffer output line by line
+  while IFS= read -r buffer_line; do
+    # Check if it's a header line (starts with ===)
+    if [[ "$buffer_line" =~ ^===.*=== ]]; then
+      echo "$buffer_line"
+    # Check if it's a data line (contains commas and URL)
+    elif [[ "$buffer_line" =~ ^[0-9]+, ]]; then
+      # Extract the date from the line (between 2nd comma and ,https://)
+      # Format: siteid,city,date,url
+      date_str=$(echo "$buffer_line" | sed 's/^[^,]*,[^,]*,\(.*\),https:.*/\1/')
+      
+      # Try to parse the date to epoch (trim spaces first)
+      date_str=$(echo "$date_str" | xargs)
+      if [[ -n "$date_str" ]] && line_epoch=$(date -j -f "%B %d, %Y" "$date_str" +%s 2>/dev/null); then
+        # Calculate current time thresholds
+        now_epoch=$(date +%s)
+        three_days=$((now_epoch + 3*24*60*60))
+        seven_days=$((now_epoch + 7*24*60*60))
+        
+        # Color based on date proximity
+        if [[ $line_epoch -le $three_days ]]; then
+          echo "${GREEN}${buffer_line}${RESET}"
+        elif [[ $line_epoch -le $seven_days ]]; then
+          echo "${YELLOW}${buffer_line}${RESET}"
+        else
+          echo "${RED}${buffer_line}${RESET}"
+        fi
+      else
+        # No valid date, print without color
+        echo "$buffer_line"
+      fi
+    else
+      # Empty line or other content, just print it
+      echo "$buffer_line"
+    fi
+  done < "$BUFFER_FILE"
+fi
+
+# Update buffer file (keep last N runs, newest on top)
+{
+  echo "$current_run"
+  printf '%s' "$current_results_plain"
+  echo ""
+  if [[ -f "$BUFFER_FILE" ]]; then
+    cat "$BUFFER_FILE"
+  fi
+} | head -n $((MAX_BUFFER_RUNS * 12)) > "${BUFFER_FILE}.tmp"
+
+mv "${BUFFER_FILE}.tmp" "$BUFFER_FILE"
