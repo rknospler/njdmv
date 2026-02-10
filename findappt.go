@@ -2,12 +2,22 @@
 // "Initial Permit" slots across several locations, color-codes the
 // results by urgency, and fires alerts (sound + email/SMS) when an
 // opening appears within 3 days.
+//
+// Usage:
+//
+//	./findappt                          # search default locations
+//	./findappt -zip 07869 -radius 25    # search within 25 mi of zip
+//	./findappt -all                     # search all 28 NJ MVC locations
+//	./findappt -list                    # print all known locations and exit
 package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,16 +41,21 @@ const (
 	maxConsecutiveAlerts = 8
 	phoneEmail           = "9736705400@tmomail.net"
 	httpTimeout          = 15 * time.Second
+	defaultRadius        = 30.0 // miles
 	colorGreen           = "\033[0;32m"
 	colorYellow          = "\033[0;33m"
 	colorRed             = "\033[0;31m"
+	colorCyan            = "\033[0;36m"
 	colorReset           = "\033[0m"
 )
 
 // Site is a single MVC location we monitor.
 type Site struct {
-	City   string // human-readable location name
-	SiteID string // numeric ID used in the portal URL
+	City   string  // human-readable location name
+	SiteID string  // numeric ID used in the portal URL
+	Lat    float64 // latitude (decimal degrees)
+	Lon    float64 // longitude (decimal degrees)
+	Zip    string  // zip code of the office
 }
 
 // Appointment holds the scraped result for one location.
@@ -53,28 +68,96 @@ type Appointment struct {
 }
 
 var (
-	// sites lists every MVC location we poll. Add or remove entries here
-	// to change which offices are monitored.
-	sites = []Site{
-		{"Newton", "485"},
-		{"Randolph", "123"},
-		{"Newark", "116"},
-		{"North Bergen", "117"},
-		{"Rahway", "122"},
-		{"Oakland", "119"},
-		{"Washington", "486"},
-		{"Lodi", "114"},
-		{"Wayne", "118"},
+	// allSites is the complete list of every NJ MVC location that offers
+	// online appointments. Coordinates are WGS-84 decimal degrees
+	// looked up from each office's zip code centroid.
+	allSites = []Site{
+		{"Bakers Basin", "101", 40.2932, -74.7399, "08648"},
+		{"Bayonne", "102", 40.6687, -74.1143, "07002"},
+		{"Camden", "104", 39.9260, -75.1196, "08104"},
+		{"Cardiff", "105", 39.3940, -74.6101, "08234"},
+		{"Delanco", "107", 40.0517, -74.9542, "08075"},
+		{"Eatontown", "108", 40.2960, -74.0510, "07724"},
+		{"Edison", "110", 40.5187, -74.4121, "08817"},
+		{"Elizabeth", "261", 40.6640, -74.2107, "07201"},
+		{"Flemington", "111", 40.4464, -74.8365, "08551"},
+		{"Freehold", "113", 40.2601, -74.2774, "07728"},
+		{"Lodi", "114", 40.8823, -74.0832, "07644"},
+		{"Manahawkin", "787", 39.6951, -74.2588, "08050"},
+		{"Newark", "116", 40.7178, -74.1712, "07114"},
+		{"Newton", "485", 41.0581, -74.7526, "07860"},
+		{"North Bergen", "117", 40.8040, -74.0121, "07047"},
+		{"Oakland", "119", 41.0135, -74.2643, "07436"},
+		{"Paterson", "120", 40.9168, -74.1719, "07505"},
+		{"Rahway", "122", 40.6080, -74.2782, "07065"},
+		{"Randolph", "123", 40.8485, -74.5866, "07869"},
+		{"Rio Grande", "103", 38.9818, -74.9579, "08204"},
+		{"Runnemede", "500", 39.8519, -75.0672, "08078"},
+		{"Salem", "106", 39.5718, -75.4709, "08079"},
+		{"South Plainfield", "109", 40.5759, -74.4115, "07080"},
+		{"Toms River", "112", 39.9712, -74.1769, "08753"},
+		{"Vineland", "115", 39.4863, -75.0259, "08360"},
+		{"Washington", "486", 40.7587, -74.9793, "07882"},
+		{"Wayne", "118", 40.9251, -74.2765, "07470"},
+		{"West Deptford", "121", 39.8518, -75.1807, "08086"},
 	}
+
+	// defaultSites is the original smaller set used when no flags are given.
+	defaultSiteIDs = map[string]bool{
+		"485": true, "123": true, "116": true, "117": true,
+		"122": true, "119": true, "486": true, "114": true, "118": true,
+	}
+
+	// activeSites holds the locations selected for this run (set in main).
+	activeSites []Site
 
 	// dateExtractRe captures the date from "Time of Appointment for <date>:".
 	dateExtractRe = regexp.MustCompile(`Time of Appointment[[:space:]]*for[[:space:]]*([^:]+):`)
 
 	// lineParseRe splits a CSV buffer line: siteID,city,date,url.
 	lineParseRe = regexp.MustCompile(`^([^,]*),([^,]*),(.*),https:(.*)`)
+
+	// originLat/originLon are set when --zip is used, for display purposes.
+	originLat, originLon float64
+	useZipFilter         bool
 )
 
 func main() {
+	zip := flag.String("zip", "", "center zip code for radius search")
+	radius := flag.Float64("radius", defaultRadius, "search radius in miles (used with -zip)")
+	all := flag.Bool("all", false, "search all 28 NJ MVC locations")
+	list := flag.Bool("list", false, "print all known locations and exit")
+	flag.Parse()
+
+	// --list: dump the full location table and exit.
+	if *list {
+		printAllLocations()
+		return
+	}
+
+	// Determine which sites to scan.
+	switch {
+	case *zip != "":
+		var err error
+		originLat, originLon, err = geocodeZip(*zip)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: could not geocode zip %q: %v\n", *zip, err)
+			os.Exit(1)
+		}
+		useZipFilter = true
+		activeSites = filterByRadius(originLat, originLon, *radius)
+		if len(activeSites) == 0 {
+			fmt.Fprintf(os.Stderr, "No MVC locations within %.0f miles of %s\n", *radius, *zip)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "📍 Searching %d locations within %.0f miles of %s\n\n", len(activeSites), *radius, *zip)
+	case *all:
+		activeSites = allSites
+		fmt.Fprintf(os.Stderr, "📍 Searching all %d NJ MVC locations\n\n", len(activeSites))
+	default:
+		activeSites = defaultSites()
+	}
+
 	results := fetchAllAppointmentsConcurrent()
 	sortAppointmentsByDate(results)
 	previous := loadPreviousRun()
@@ -88,6 +171,102 @@ func main() {
 	updateBuffer(currentTime, results)
 }
 
+// defaultSites returns the original 9-site set for backward compatibility.
+func defaultSites() []Site {
+	var out []Site
+	for _, s := range allSites {
+		if defaultSiteIDs[s.SiteID] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// printAllLocations dumps every known MVC office to stdout.
+func printAllLocations() {
+	fmt.Printf("%-4s  %-20s  %-8s  %8s  %9s\n", "ID", "City", "Zip", "Lat", "Lon")
+	fmt.Println(strings.Repeat("─", 60))
+	for _, s := range allSites {
+		fmt.Printf("%-4s  %-20s  %-8s  %8.4f  %9.4f\n",
+			s.SiteID, s.City, s.Zip, s.Lat, s.Lon)
+	}
+	fmt.Printf("\n%d locations total\n", len(allSites))
+}
+
+// ---------------------------------------------------------------------------
+// Geocoding & Distance
+// ---------------------------------------------------------------------------
+
+// geocodeZip resolves a US zip code to lat/lon using the free
+// zippopotam.us API (no key required).
+func geocodeZip(zip string) (float64, float64, error) {
+	client := &http.Client{Timeout: httpTimeout}
+	resp, err := client.Get("https://api.zippopotam.us/us/" + zip)
+	if err != nil {
+		return 0, 0, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, 0, fmt.Errorf("zip code not found (HTTP %d)", resp.StatusCode)
+	}
+
+	var result struct {
+		Places []struct {
+			Lat string `json:"latitude"`
+			Lon string `json:"longitude"`
+		} `json:"places"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, 0, fmt.Errorf("decode failed: %w", err)
+	}
+	if len(result.Places) == 0 {
+		return 0, 0, fmt.Errorf("no results for zip %s", zip)
+	}
+
+	var lat, lon float64
+	fmt.Sscanf(result.Places[0].Lat, "%f", &lat)
+	fmt.Sscanf(result.Places[0].Lon, "%f", &lon)
+	return lat, lon, nil
+}
+
+// haversine returns the great-circle distance in miles between two
+// points given in decimal degrees.
+func haversine(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadiusMiles = 3958.8
+	dLat := (lat2 - lat1) * math.Pi / 180
+	dLon := (lon2 - lon1) * math.Pi / 180
+	la1 := lat1 * math.Pi / 180
+	la2 := lat2 * math.Pi / 180
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(la1)*math.Cos(la2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return earthRadiusMiles * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+// filterByRadius returns all sites within the given radius (miles)
+// from the origin point, sorted by distance.
+func filterByRadius(lat, lon, radius float64) []Site {
+	type ranked struct {
+		site Site
+		dist float64
+	}
+	var matches []ranked
+	for _, s := range allSites {
+		d := haversine(lat, lon, s.Lat, s.Lon)
+		if d <= radius {
+			matches = append(matches, ranked{s, d})
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].dist < matches[j].dist
+	})
+	out := make([]Site, len(matches))
+	for i, m := range matches {
+		out[i] = m.site
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Concurrent Fetching
 // ---------------------------------------------------------------------------
@@ -97,9 +276,9 @@ func main() {
 // goroutine writes to its own index).
 func fetchAllAppointmentsConcurrent() []Appointment {
 	var wg sync.WaitGroup
-	results := make([]Appointment, len(sites))
+	results := make([]Appointment, len(activeSites))
 
-	for i, site := range sites {
+	for i, site := range activeSites {
 		wg.Add(1)
 		go func(index int, s Site) {
 			defer wg.Done()
@@ -374,8 +553,19 @@ func displayResultsWithDiff(current []Appointment, previous map[string]Appointme
 }
 
 // formatLine renders one appointment as a CSV-style string.
+// When running with --zip, it appends the distance from the origin.
 func formatLine(appt Appointment) string {
-	return fmt.Sprintf("%s,%s,%s,%s", appt.SiteID, appt.City, appt.RawDate, appt.URL)
+	base := fmt.Sprintf("%s,%s,%s,%s", appt.SiteID, appt.City, appt.RawDate, appt.URL)
+	if useZipFilter {
+		// Look up site coordinates for distance display.
+		for _, s := range activeSites {
+			if s.SiteID == appt.SiteID {
+				d := haversine(originLat, originLon, s.Lat, s.Lon)
+				return fmt.Sprintf("%s  %s(%.0f mi)%s", base, colorCyan, d, colorReset)
+			}
+		}
+	}
+	return base
 }
 
 // calculateDiffMarker compares the current appointment against the
