@@ -4,62 +4,89 @@ Monitors NJ Motor Vehicle Commission appointment availability across multiple lo
 
 ## How It Works
 
-Scrapes the [NJ MVC appointment portal](https://telegov.njportal.com/njmvc/AppointmentWizard/11) for the earliest available "Initial Permit" appointments at up to 28 NJ MVC locations. Fetches are concurrent for speed.
+Scrapes the [NJ MVC appointment portal](https://telegov.njportal.com/njmvc/AppointmentWizard) for the earliest available appointments across NJ MVC locations. Supports 11 service types (license renewal, Real ID, registration, CDL, etc.) — each with its own set of locations and site IDs, all discovered dynamically from the portal at startup. Fetches are concurrent for speed.
 
 Each run:
-1. Fetches the earliest appointment date from each site
-2. Sorts results by date (soonest first)
-3. Compares against the previous run and shows diff markers (⬇️ earlier, ⬆️ later, ✨ new, ❌ removed)
-4. Color-codes output: **green** (< 3 days), **yellow** (< 7 days), **red** (7+ days)
-5. Triggers alerts (sound + email/SMS) for appointments within 3 days
+1. Fetches the service index page to discover which locations offer that service
+2. Fetches the earliest appointment date from each location concurrently
+3. Sorts results by date (soonest first)
+4. Compares against the previous run and shows diff markers (⬇️ earlier, ⬆️ later, ✨ new, ❌ removed)
+5. Color-codes output: **green** (< 3 days), **yellow** (< 7 days), **red** (7+ days)
+6. Triggers alerts (sound + email/SMS) for appointments within 3 days
 
 ## Usage
 
-```bash
-# Default: search the original 9 northern NJ locations
-./findappt
+Either `-zip` or `-all` is required. Use `-service` to pick the appointment type (default: `renewal`).
 
-# Search all 28 NJ MVC locations
+```bash
+# Search all locations for license renewal (default)
 ./findappt -all
 
-# Search within 25 miles of a zip code
-./findappt -zip 07869 -radius 25
+# Registration renewal at all locations
+./findappt -all -service registration
 
-# Search within default 30 miles of a zip code
-./findappt -zip 07114
+# Real ID within 25 miles of a zip code
+./findappt -zip 07869 -radius 25 -service realid
 
-# List all known MVC locations and exit
-./findappt -list
+# Search with SMS notification
+./findappt -all -service title -notify 5551234567@tmomail.net
+
+# List locations that offer a specific service
+./findappt -list -service registration
+
+# List all available service types
+./findappt -services
 ```
 
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-service` | `renewal` | Service type (`renewal`, `realid`, `registration`, `title`, `permit`, etc.) |
 | `-zip` | *(none)* | Center zip code for radius-based search |
 | `-radius` | `30` | Search radius in miles (used with `-zip`) |
-| `-all` | `false` | Search all 28 NJ MVC locations |
-| `-list` | `false` | Print all known locations and exit |
+| `-all` | `false` | Search all locations for the selected service |
+| `-notify` | *(none)* | Email/SMS gateway address for alerts (e.g. `5551234567@tmomail.net`) |
+| `-list` | `false` | Print locations for the selected service and exit |
+| `-services` | `false` | List all available service types and exit |
+
+### Service Types
+
+| Name | Description |
+|------|-------------|
+| `renewal` | License / Non-Driver ID Renewal |
+| `realid` | Real ID |
+| `permit` | Initial Permit (before knowledge test) |
+| `title` | New Title or Registration |
+| `registration` | Registration Renewal |
+| `replace-title` | Replacement Title |
+| `transfer` | Transfer from Out of State |
+| `cdl-permit` | CDL Permit or Endorsement |
+| `non-driver` | Non-Driver ID (new) |
+| `knowledge` | Knowledge Test (non-CDL) |
+| `cdl-knowledge` | CDL Knowledge Test |
+
+Not all locations offer every service. The tool dynamically discovers which locations are available for your chosen service type.
 
 When using `-zip`, the program geocodes the zip code via [zippopotam.us](http://api.zippopotam.us) (free, no key required), then filters to locations within the radius using the Haversine formula. Distance in miles is shown next to each result.
 
 ## Alerts
 
 - Plays a system sound (`Glass.aiff`) when an appointment is found within 3 days
-- Sends an email/SMS via `mail` to a configured T-Mobile gateway address
+- When `-notify` is set, sends an email/SMS via `mail` to the given address
 - Tracks alerts per appointment key and suppresses after 8 consecutive alerts for the same slot
 
 ## Build & Run
 
 ```bash
 go build -o findappt findappt.go
-./findappt
+./findappt -all
 ```
 
 Run on a loop with `watch`:
 
 ```bash
-watch -n 30 ./findappt
+watch -n 30 ./findappt -all
 ```
 
 ## State Files
@@ -75,3 +102,15 @@ watch -n 30 ./findappt
 - Go 1.21+
 - macOS `afplay` for sound alerts
 - `mail` command (Postfix) for email/SMS — see `setup_postfix.sh`
+
+## Rate Limiting / Responsible Use
+
+**Do not run this tool too frequently.** Each invocation makes one request per location (20–28 HTTP requests depending on the service), plus one request to discover the location list. Running it every 30–60 seconds is reasonable; running it every few seconds will likely get your IP temporarily or permanently banned by the NJ MVC portal.
+
+If you are using `watch`, keep the interval at **30 seconds or more**:
+
+```bash
+watch -n 60 ./findappt -all
+```
+
+This tool is for personal use. Be respectful of the state's infrastructure.

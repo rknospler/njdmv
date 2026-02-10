@@ -1,14 +1,18 @@
 // findappt polls NJ MVC appointment pages for the earliest available
-// "Initial Permit" slots across several locations, color-codes the
-// results by urgency, and fires alerts (sound + email/SMS) when an
-// opening appears within 3 days.
+// slots across several locations, color-codes the results by urgency,
+// and fires alerts (sound + email/SMS) when an opening appears within
+// 3 days.
 //
 // Usage:
 //
-//	./findappt                          # search default locations
-//	./findappt -zip 07869 -radius 25    # search within 25 mi of zip
-//	./findappt -all                     # search all 28 NJ MVC locations
-//	./findappt -list                    # print all known locations and exit
+//	./findappt -all                                  # license renewal (default service)
+//	./findappt -all -service registration             # registration renewal
+//	./findappt -all -service realid                   # Real ID
+//	./findappt -all -service title                    # new title/registration
+//	./findappt -zip 07869 -radius 25                 # search within 25 mi of zip
+//	./findappt -all -notify 5551234567@tmomail.net   # also send SMS alerts
+//	./findappt -list                                 # list locations for service
+//	./findappt -services                             # list all service types
 package main
 
 import (
@@ -33,13 +37,12 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	baseURL              = "https://telegov.njportal.com/njmvc/AppointmentWizard/11"
+	portalBase           = "https://telegov.njportal.com/njmvc/AppointmentWizard"
 	bufferFile           = "/tmp/findappt_buffer.txt"
 	alertCountFile       = "/tmp/findappt_alert_counts.txt"
 	emailSentFile        = "/tmp/findappt_emails_sent.txt"
 	maxBufferRuns        = 3
 	maxConsecutiveAlerts = 8
-	phoneEmail           = "9736705400@tmomail.net"
 	httpTimeout          = 15 * time.Second
 	defaultRadius        = 30.0 // miles
 	colorGreen           = "\033[0;32m"
@@ -49,10 +52,32 @@ const (
 	colorReset           = "\033[0m"
 )
 
+// ServiceType maps a user-friendly name to the portal path number.
+type ServiceType struct {
+	Name   string // short CLI name
+	Label  string // human-readable description
+	PathID string // the number in /AppointmentWizard/<PathID>
+}
+
+// serviceTypes is the catalog of supported appointment types.
+var serviceTypes = []ServiceType{
+	{"renewal", "License / Non-Driver ID Renewal", "11"},
+	{"realid", "Real ID", "12"},
+	{"permit", "Initial Permit (before knowledge test)", "15"},
+	{"title", "New Title or Registration", "8"},
+	{"registration", "Registration Renewal", "10"},
+	{"replace-title", "Replacement Title", "13"},
+	{"transfer", "Transfer from Out of State", "7"},
+	{"cdl-permit", "CDL Permit or Endorsement", "14"},
+	{"non-driver", "Non-Driver ID (new)", "16"},
+	{"knowledge", "Knowledge Test (non-CDL)", "19"},
+	{"cdl-knowledge", "CDL Knowledge Test", "20"},
+}
+
 // Site is a single MVC location we monitor.
 type Site struct {
-	City   string  // human-readable location name
-	SiteID string  // numeric ID used in the portal URL
+	City   string  // human-readable location name (e.g. "Bakers Basin")
+	SiteID string  // numeric ID used in the portal URL (varies by service!)
 	Lat    float64 // latitude (decimal degrees)
 	Lon    float64 // longitude (decimal degrees)
 	Zip    string  // zip code of the office
@@ -60,59 +85,80 @@ type Site struct {
 
 // Appointment holds the scraped result for one location.
 type Appointment struct {
-	Epoch   int64  // unix timestamp of the earliest slot (0 = unavailable)
-	SiteID  string // matches Site.SiteID
-	City    string // matches Site.City
-	RawDate string // date string as shown on the page, e.g. "March 5, 2026"
-	URL     string // direct link to the booking page
+	Epoch    int64  // unix timestamp of the earliest slot (0 = unavailable)
+	SiteID   string // matches Site.SiteID
+	City     string // matches Site.City
+	RawDate  string // date string as shown on the page, e.g. "March 5, 2026"
+	URL      string // direct link to the booking page
+	FetchErr string // non-empty if the request failed (timeout, blocked, etc.)
+}
+
+// gpsLookup maps a normalized zip code prefix (first 5 digits) to
+// GPS coordinates. This table covers every zip seen across all MVC
+// service types so that we never need a network geocode call.
+var gpsLookup = map[string][2]float64{
+	"08648": {40.2932, -74.7399}, // Bakers Basin / Lawrenceville
+	"07002": {40.6687, -74.1143}, // Bayonne
+	"08104": {39.9260, -75.1196}, // Camden
+	"08234": {39.3940, -74.6101}, // Cardiff / Egg Harbor Twp
+	"08075": {40.0517, -74.9542}, // Delanco
+	"07724": {40.2960, -74.0510}, // Eatontown
+	"08817": {40.5187, -74.4121}, // Edison
+	"07201": {40.6640, -74.2107}, // Elizabeth
+	"08551": {40.4464, -74.8365}, // Flemington
+	"07728": {40.2601, -74.2774}, // Freehold
+	"07644": {40.8823, -74.0832}, // Lodi
+	"08050": {39.6951, -74.2588}, // Manahawkin
+	"07114": {40.7178, -74.1712}, // Newark
+	"07860": {41.0581, -74.7526}, // Newton
+	"07047": {40.8040, -74.0121}, // North Bergen
+	"07436": {41.0135, -74.2643}, // Oakland
+	"07505": {40.9168, -74.1719}, // Paterson
+	"07065": {40.6080, -74.2782}, // Rahway
+	"07869": {40.8485, -74.5866}, // Randolph
+	"08204": {38.9818, -74.9579}, // Rio Grande
+	"08078": {39.8519, -75.0672}, // Runnemede
+	"08079": {39.5718, -75.4709}, // Salem
+	"07080": {40.5759, -74.4115}, // South Plainfield
+	"08753": {39.9712, -74.1769}, // Toms River
+	"08360": {39.4863, -75.0259}, // Vineland
+	"07882": {40.7587, -74.9793}, // Washington
+	"07470": {40.9251, -74.2765}, // Wayne
+	"08086": {39.8518, -75.1807}, // West Deptford
+	// Registration / title-only offices:
+	"08002": {39.9348, -75.0307}, // Cherry Hill
+	"07018": {40.7644, -74.2150}, // East Orange
+	"07730": {40.4155, -74.1857}, // Hazlet
+	"07307": {40.7489, -74.0565}, // Jersey City
+	"08701": {40.0879, -74.2066}, // Lakewood
+	"08055": {39.8688, -74.8236}, // Medford
+	"08876": {40.5740, -74.6099}, // Somerville
+	"08810": {40.3862, -74.5333}, // South Brunswick
+	"07081": {40.6989, -74.3215}, // Springfield
+	"08666": {40.2206, -74.7698}, // Trenton Regional
+	"08012": {39.7718, -75.0521}, // Turnersville
+	"07057": {40.8534, -74.1070}, // Wallington
 }
 
 var (
-	// allSites is the complete list of every NJ MVC location that offers
-	// online appointments. Coordinates are WGS-84 decimal degrees
-	// looked up from each office's zip code centroid.
-	allSites = []Site{
-		{"Bakers Basin", "101", 40.2932, -74.7399, "08648"},
-		{"Bayonne", "102", 40.6687, -74.1143, "07002"},
-		{"Camden", "104", 39.9260, -75.1196, "08104"},
-		{"Cardiff", "105", 39.3940, -74.6101, "08234"},
-		{"Delanco", "107", 40.0517, -74.9542, "08075"},
-		{"Eatontown", "108", 40.2960, -74.0510, "07724"},
-		{"Edison", "110", 40.5187, -74.4121, "08817"},
-		{"Elizabeth", "261", 40.6640, -74.2107, "07201"},
-		{"Flemington", "111", 40.4464, -74.8365, "08551"},
-		{"Freehold", "113", 40.2601, -74.2774, "07728"},
-		{"Lodi", "114", 40.8823, -74.0832, "07644"},
-		{"Manahawkin", "787", 39.6951, -74.2588, "08050"},
-		{"Newark", "116", 40.7178, -74.1712, "07114"},
-		{"Newton", "485", 41.0581, -74.7526, "07860"},
-		{"North Bergen", "117", 40.8040, -74.0121, "07047"},
-		{"Oakland", "119", 41.0135, -74.2643, "07436"},
-		{"Paterson", "120", 40.9168, -74.1719, "07505"},
-		{"Rahway", "122", 40.6080, -74.2782, "07065"},
-		{"Randolph", "123", 40.8485, -74.5866, "07869"},
-		{"Rio Grande", "103", 38.9818, -74.9579, "08204"},
-		{"Runnemede", "500", 39.8519, -75.0672, "08078"},
-		{"Salem", "106", 39.5718, -75.4709, "08079"},
-		{"South Plainfield", "109", 40.5759, -74.4115, "07080"},
-		{"Toms River", "112", 39.9712, -74.1769, "08753"},
-		{"Vineland", "115", 39.4863, -75.0259, "08360"},
-		{"Washington", "486", 40.7587, -74.9793, "07882"},
-		{"Wayne", "118", 40.9251, -74.2765, "07470"},
-		{"West Deptford", "121", 39.8518, -75.1807, "08086"},
-	}
-
-	// defaultSites is the original smaller set used when no flags are given.
-	defaultSiteIDs = map[string]bool{
-		"485": true, "123": true, "116": true, "117": true,
-		"122": true, "119": true, "486": true, "114": true, "118": true,
-	}
-
 	// activeSites holds the locations selected for this run (set in main).
 	activeSites []Site
 
+	// allSites is populated at startup from the portal's locationData JSON
+	// for the selected service type.
+	allSites []Site
+
+	// activeService is the selected service (set in main).
+	activeService ServiceType
+
+	// notifyAddr is the email/SMS gateway address for alerts (empty = no email).
+	notifyAddr string
+
 	// dateExtractRe captures the date from "Time of Appointment for <date>:".
 	dateExtractRe = regexp.MustCompile(`Time of Appointment[[:space:]]*for[[:space:]]*([^:]+):`)
+
+	// locationDataRe extracts the locationData JSON array from the index page.
+	locationDataRe = regexp.MustCompile(`var locationData\s*=\s*(\[.*?\]);`)
 
 	// lineParseRe splits a CSV buffer line: siteID,city,date,url.
 	lineParseRe = regexp.MustCompile(`^([^,]*),([^,]*),(.*),https:(.*)`)
@@ -120,25 +166,72 @@ var (
 	// originLat/originLon are set when --zip is used, for display purposes.
 	originLat, originLon float64
 	useZipFilter         bool
+
+	// runParams summarizes the CLI flags used for this run, stored in the buffer.
+	runParams string
 )
 
 func main() {
 	zip := flag.String("zip", "", "center zip code for radius search")
 	radius := flag.Float64("radius", defaultRadius, "search radius in miles (used with -zip)")
-	all := flag.Bool("all", false, "search all 28 NJ MVC locations")
-	list := flag.Bool("list", false, "print all known locations and exit")
+	all := flag.Bool("all", false, "search all locations for this service")
+	list := flag.Bool("list", false, "print locations for this service and exit")
+	notify := flag.String("notify", "", "email/SMS gateway address for alerts (e.g. 5551234567@tmomail.net)")
+	service := flag.String("service", "renewal", "service type (use -services to list)")
+	showServices := flag.Bool("services", false, "list all available service types and exit")
 	flag.Parse()
 
-	// --list: dump the full location table and exit.
+	// --services: print the service catalog and exit.
+	if *showServices {
+		printServiceTypes()
+		return
+	}
+
+	// Look up the requested service type.
+	svc, ok := lookupService(*service)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Unknown service %q. Use -services to see available types.\n", *service)
+		os.Exit(1)
+	}
+	activeService = svc
+
+	// Fetch the service's index page to discover locations + site IDs.
+	var err error
+	allSites, err = discoverSites(activeService)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: could not load locations for %s: %v\n", activeService.Label, err)
+		os.Exit(1)
+	}
+
+	// --list: dump the location table for the selected service and exit.
 	if *list {
+		fmt.Fprintf(os.Stderr, "Service: %s\n\n", activeService.Label)
 		printAllLocations()
 		return
 	}
 
+	notifyAddr = *notify
+
+	// Require either -zip or -all.
+	if *zip == "" && !*all {
+		fmt.Fprintf(os.Stderr, "Usage: findappt -all [-service <type>] [-notify <addr>]\n")
+		fmt.Fprintf(os.Stderr, "       findappt -zip <zipcode> [-radius <miles>] [-service <type>] [-notify <addr>]\n")
+		fmt.Fprintf(os.Stderr, "       findappt -list [-service <type>]\n")
+		fmt.Fprintf(os.Stderr, "       findappt -services\n\n")
+		fmt.Fprintf(os.Stderr, "Services:\n")
+		for _, s := range serviceTypes {
+			fmt.Fprintf(os.Stderr, "  %-16s %s\n", s.Name, s.Label)
+		}
+		fmt.Fprintf(os.Stderr, "\nFlags:\n")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "🔧 Service: %s\n", activeService.Label)
+
 	// Determine which sites to scan.
 	switch {
 	case *zip != "":
-		var err error
 		originLat, originLon, err = geocodeZip(*zip)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: could not geocode zip %q: %v\n", *zip, err)
@@ -151,43 +244,127 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "📍 Searching %d locations within %.0f miles of %s\n\n", len(activeSites), *radius, *zip)
+		runParams = fmt.Sprintf("-service %s -zip %s -radius %.0f", activeService.Name, *zip, *radius)
 	case *all:
 		activeSites = allSites
-		fmt.Fprintf(os.Stderr, "📍 Searching all %d NJ MVC locations\n\n", len(activeSites))
-	default:
-		activeSites = defaultSites()
+		fmt.Fprintf(os.Stderr, "📍 Searching all %d locations\n\n", len(activeSites))
+		runParams = fmt.Sprintf("-service %s -all", activeService.Name)
 	}
 
 	results := fetchAllAppointmentsConcurrent()
+	reportFetchErrors(results)
 	sortAppointmentsByDate(results)
 	previous := loadPreviousRun()
 	handleAlerts(results)
 
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 	fmt.Printf("=== Run at %s ===\n", currentTime)
+	fmt.Printf("    %s\n", runParams)
 	displayResultsWithDiff(results, previous)
 	fmt.Println()
 	displayPreviousRuns()
 	updateBuffer(currentTime, results)
 }
 
-// defaultSites returns the original 9-site set for backward compatibility.
-func defaultSites() []Site {
-	var out []Site
-	for _, s := range allSites {
-		if defaultSiteIDs[s.SiteID] {
-			out = append(out, s)
+// lookupService returns the ServiceType matching the given name.
+func lookupService(name string) (ServiceType, bool) {
+	for _, s := range serviceTypes {
+		if strings.EqualFold(s.Name, name) {
+			return s, true
 		}
 	}
-	return out
+	return ServiceType{}, false
+}
+
+// printServiceTypes lists all known service types to stdout.
+func printServiceTypes() {
+	fmt.Printf("%-16s  %s\n", "Name", "Description")
+	fmt.Println(strings.Repeat("─", 55))
+	for _, s := range serviceTypes {
+		fmt.Printf("%-16s  %s\n", s.Name, s.Label)
+	}
+}
+
+// discoverSites fetches the service's index page from the NJ MVC portal,
+// parses the embedded locationData JSON, and returns the list of Sites
+// with their service-specific site IDs and GPS coordinates.
+func discoverSites(svc ServiceType) ([]Site, error) {
+	client := &http.Client{Timeout: httpTimeout}
+	resp, err := client.Get(fmt.Sprintf("%s/%s", portalBase, svc.PathID))
+	if err != nil {
+		return nil, fmt.Errorf("fetch index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	matches := locationDataRe.FindSubmatch(body)
+	if matches == nil {
+		return nil, fmt.Errorf("locationData not found in page")
+	}
+
+	var locations []struct {
+		Name string `json:"Name"`
+		Zip  string `json:"Zip"`
+		Loc  []struct {
+			LocationId int `json:"LocationId"`
+		} `json:"LocAppointments"`
+	}
+	if err := json.Unmarshal(matches[1], &locations); err != nil {
+		return nil, fmt.Errorf("parse locationData: %w", err)
+	}
+
+	var sites []Site
+	for _, loc := range locations {
+		if len(loc.Loc) == 0 {
+			continue
+		}
+		city := loc.Name
+		if idx := strings.Index(city, " - "); idx > 0 {
+			city = strings.TrimSpace(city[:idx])
+		}
+		// Also handle the " -" variant (some entries have no space before dash).
+		if idx := strings.Index(city, " -"); idx > 0 {
+			city = strings.TrimSpace(city[:idx])
+		}
+
+		zip5 := loc.Zip
+		if len(zip5) > 5 {
+			zip5 = zip5[:5] // e.g. "08234-3935" → "08234"
+		}
+
+		var lat, lon float64
+		if coords, ok := gpsLookup[zip5]; ok {
+			lat, lon = coords[0], coords[1]
+		} else {
+			// Fallback: geocode from zip (shouldn't normally happen).
+			lat, lon, _ = geocodeZip(zip5)
+		}
+
+		sites = append(sites, Site{
+			City:   city,
+			SiteID: fmt.Sprintf("%d", loc.Loc[0].LocationId),
+			Lat:    lat,
+			Lon:    lon,
+			Zip:    zip5,
+		})
+	}
+
+	if len(sites) == 0 {
+		return nil, fmt.Errorf("no locations found")
+	}
+	return sites, nil
 }
 
 // printAllLocations dumps every known MVC office to stdout.
 func printAllLocations() {
-	fmt.Printf("%-4s  %-20s  %-8s  %8s  %9s\n", "ID", "City", "Zip", "Lat", "Lon")
+	fmt.Printf("%-5s  %-20s  %-8s  %8s  %9s\n", "ID", "City", "Zip", "Lat", "Lon")
 	fmt.Println(strings.Repeat("─", 60))
 	for _, s := range allSites {
-		fmt.Printf("%-4s  %-20s  %-8s  %8.4f  %9.4f\n",
+		fmt.Printf("%-5s  %-20s  %-8s  %8.4f  %9.4f\n",
 			s.SiteID, s.City, s.Zip, s.Lat, s.Lon)
 	}
 	fmt.Printf("\n%d locations total\n", len(allSites))
@@ -291,18 +468,29 @@ func fetchAllAppointmentsConcurrent() []Appointment {
 }
 
 // fetchAppointment downloads one location's page and extracts the earliest
-// available date. Returns a zero-epoch appointment on any network error.
+// available date. Returns a zero-epoch appointment on any network error,
+// recording the failure reason in FetchErr.
 func fetchAppointment(site Site) Appointment {
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Get(buildURL(site.SiteID))
 	if err != nil {
-		return newAppointment(site, "", 0)
+		appt := newAppointment(site, "", 0)
+		appt.FetchErr = fmt.Sprintf("request failed: %v", err)
+		return appt
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		appt := newAppointment(site, "", 0)
+		appt.FetchErr = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		return appt
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return newAppointment(site, "", 0)
+		appt := newAppointment(site, "", 0)
+		appt.FetchErr = fmt.Sprintf("read body: %v", err)
+		return appt
 	}
 
 	rawDate := extractDate(string(body))
@@ -324,9 +512,28 @@ func newAppointment(site Site, rawDate string, epoch int64) Appointment {
 	}
 }
 
-// buildURL returns the full appointment-wizard URL for a given site.
+// reportFetchErrors prints a summary of any locations that failed to respond.
+func reportFetchErrors(results []Appointment) {
+	var failures []Appointment
+	for _, r := range results {
+		if r.FetchErr != "" {
+			failures = append(failures, r)
+		}
+	}
+	if len(failures) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "⚠️  %d/%d locations failed to respond:\n", len(failures), len(results))
+	for _, f := range failures {
+		fmt.Fprintf(os.Stderr, "   %s (%s): %s\n", f.City, f.SiteID, f.FetchErr)
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// buildURL returns the full appointment-wizard URL for a given site,
+// using the active service's path.
 func buildURL(siteID string) string {
-	return fmt.Sprintf("%s/%s", baseURL, siteID)
+	return fmt.Sprintf("%s/%s/%s", portalBase, activeService.PathID, siteID)
 }
 
 // sortAppointmentsByDate orders appointments soonest-first, pushing
@@ -440,10 +647,10 @@ func triggerAlert(appt *Appointment, key string, count int) {
 
 	playSound()
 
-	if !emailAlreadySent(key) {
+	if notifyAddr != "" && !emailAlreadySent(key) {
 		sendEmail(info)
 		markEmailSent(key)
-		fmt.Fprintf(os.Stderr, "📧 Email sent for this appointment\n")
+		fmt.Fprintf(os.Stderr, "📧 Email sent to %s\n", notifyAddr)
 	}
 
 	incrementAlertCount(key, count)
@@ -475,7 +682,7 @@ func playSound() {
 // sendEmail pipes a message into the mail command, which is expected to
 // relay to the T-Mobile SMS-to-email gateway.
 func sendEmail(message string) {
-	cmd := exec.Command("mail", "-s", "NJ MVC Appointment Available", phoneEmail)
+	cmd := exec.Command("mail", "-s", "NJ MVC Appointment Available", notifyAddr)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return
@@ -615,15 +822,27 @@ func printLine(line, marker, color string) {
 }
 
 // displayRemovedSites prints entries that existed in the previous run
-// but are no longer present in the current site list.
+// but are no longer present in the current results. Only considers sites
+// that are in the current search scope (activeSites) to avoid false
+// "removed" markers when search parameters change between runs.
 func displayRemovedSites(current []Appointment, previous map[string]Appointment) {
 	for siteID, prevAppt := range previous {
-		if !siteExists(siteID, current) && prevAppt.RawDate != "" {
-			line := fmt.Sprintf("%s,%s,%s,%s ❌ (site removed)",
+		if !siteExists(siteID, current) && prevAppt.RawDate != "" && siteInScope(siteID) {
+			line := fmt.Sprintf("%s,%s,%s,%s ❌ (removed)",
 				prevAppt.SiteID, prevAppt.City, prevAppt.RawDate, prevAppt.URL)
 			fmt.Println(line)
 		}
 	}
+}
+
+// siteInScope returns true if siteID is in the current activeSites list.
+func siteInScope(siteID string) bool {
+	for _, s := range activeSites {
+		if s.SiteID == siteID {
+			return true
+		}
+	}
+	return false
 }
 
 // siteExists returns true if siteID appears anywhere in the slice.
@@ -738,6 +957,7 @@ func updateBuffer(currentTime string, results []Appointment) {
 
 	var buffer strings.Builder
 	buffer.WriteString(fmt.Sprintf("=== Run at %s ===\n", currentTime))
+	buffer.WriteString(fmt.Sprintf("    %s\n", runParams))
 	for _, appt := range results {
 		buffer.WriteString(fmt.Sprintf("%s,%s,%s,%s\n", appt.SiteID, appt.City, appt.RawDate, appt.URL))
 	}
