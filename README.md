@@ -101,7 +101,43 @@ watch -n 30 ./findappt -all
 
 - Go 1.21+
 - macOS `afplay` for sound alerts
-- `mail` command (Postfix) for email/SMS — see `setup_postfix.sh`
+- `mail` command (Postfix) for email/SMS — see below
+
+## Email / SMS Setup
+
+The `-notify` flag requires a working `mail` command, which on macOS uses Postfix. Run `setup_postfix.sh` to configure Postfix as an SMTP relay through any provider:
+
+```bash
+# Interactive — prompts for host, user, password
+./setup_postfix.sh
+
+# Non-interactive — pass everything via flags
+./setup_postfix.sh \
+  --smtp-host smtp.gmail.com \
+  --smtp-port 587 \
+  --smtp-user you@gmail.com \
+  --smtp-pass 'xxxx xxxx xxxx xxxx' \
+  --test-addr 5551234567@tmomail.net
+```
+
+Run `./setup_postfix.sh --help` for all options.
+
+**Common SMTP hosts:**
+
+| Provider | Host | Port | Notes |
+|----------|------|------|-------|
+| Gmail | `smtp.gmail.com` | 587 | Requires [App Password](https://myaccount.google.com/apppasswords) |
+| Outlook | `smtp.office365.com` | 587 | |
+| Yahoo | `smtp.mail.yahoo.com` | 587 | |
+| iCloud | `smtp.mail.me.com` | 587 | Requires App Password |
+
+**SMS via email gateway:** Most carriers accept email-to-SMS. Pass the gateway address to `-notify`:
+
+| Carrier | Gateway format |
+|---------|---------------|
+| T-Mobile | `<number>@tmomail.net` |
+| Verizon | `<number>@vtext.com` |
+| AT&T | `<number>@txt.att.net` |
 
 ## Rate Limiting / Responsible Use
 
