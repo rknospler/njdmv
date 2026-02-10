@@ -11,13 +11,20 @@
 
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-SMTP_HOST=""
-SMTP_PORT="587"
-SMTP_USER=""
-SMTP_PASS=""
-TEST_ADDR=""
-TLS_CA="/etc/ssl/cert.pem"
+# ── Load .env if present ──────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/.env"
+fi
+
+# ── Defaults (overridden by .env or CLI flags) ───────────────────────────────
+SMTP_HOST="${SMTP_HOST:-}"
+SMTP_PORT="${SMTP_PORT:-587}"
+SMTP_USER="${SMTP_USER:-}"
+SMTP_PASS="${SMTP_PASS:-}"
+TEST_ADDR="${TEST_ADDR:-}"
+TLS_CA="${TLS_CA:-/etc/ssl/cert.pem}"
 
 # ── Parse CLI flags ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
